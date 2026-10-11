@@ -1,0 +1,10 @@
+{
+  "description": "Offers tailored basketball training lessons and personal goal-setting tools to help players improve skills and track progress effectively.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
