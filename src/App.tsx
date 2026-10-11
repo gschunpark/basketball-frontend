@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 
 type Tab = "lessons" | "goals" | "streak" | "profile";
 type PlayerLevel = "Beginner" | "Intermediate" | "Advanced" | "NBA";
+type DominantHand = "right" | "left";
 
 const levelUnitNumber: Record<PlayerLevel, number> = {
   Beginner: 1,
@@ -538,7 +539,7 @@ function LessonComplete({ lesson, result, onContinue }: {
           </div>)}
         </div>
         <p className="completion-note">{lesson.cameraDrill
-          ? "Good reps were inside a green box. Bad reps were outside both boxes."
+          ? "Good reps were inside the green box. Bad reps were outside the box."
           : "Rep tracking is available in the first dribbling drill."}</p>
       </section>
       <footer className="completion-footer"><button type="button" onClick={onContinue} autoFocus>Continue<Icon name="arrow" /></button></footer>
@@ -575,6 +576,7 @@ function DrillScreen({
   onExit,
   onComplete,
   reward,
+  dominantHand,
 }: {
   lesson: Lesson;
   stream: MediaStream | null;
@@ -584,6 +586,7 @@ function DrillScreen({
   onExit: () => void;
   onComplete: (result: DrillResult) => void;
   reward: number;
+  dominantHand: DominantHand;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -688,8 +691,9 @@ function DrillScreen({
       const normalizedX = 1 - cameraX;
       const normalizedY = totalY / matchingPixels / canvas.height;
       const inside =
-        ((normalizedX >= 0.08 && normalizedX <= 0.28) ||
-          (normalizedX >= 0.72 && normalizedX <= 0.92)) &&
+        (dominantHand === "right"
+          ? normalizedX >= 0.08 && normalizedX <= 0.28
+          : normalizedX >= 0.72 && normalizedX <= 0.92) &&
         normalizedY >= 0.14 &&
         normalizedY <= 0.86;
 
@@ -720,7 +724,7 @@ function DrillScreen({
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [stream, lesson.cameraDrill]);
+  }, [stream, lesson.cameraDrill, dominantHand]);
 
   return (
     <main className="drill-page">
@@ -743,8 +747,7 @@ function DrillScreen({
               <video ref={videoRef} muted playsInline />
               <canvas ref={canvasRef} aria-hidden="true" />
               {lesson.cameraDrill && <>
-                <div className="target-zone target-zone-left"><span>+1</span></div>
-                <div className="target-zone target-zone-right"><span>+1</span></div>
+                <div className={`target-zone target-zone-${dominantHand === "right" ? "left" : "right"}`}><span>+1</span></div>
               </>}
               {ballPosition && (
                 <span
@@ -794,7 +797,7 @@ function DrillScreen({
                 </li>
                 <li>
                   <span>3</span>
-                  Each detected dribble scores +1 inside a green box or -1 outside. Your score can go below zero.
+                  Each detected dribble scores +1 inside the green box or -1 outside. Your score can go below zero.
                 </li>
               </ol>
             </section>
@@ -1365,6 +1368,8 @@ function ProfileView({
   onProfileImageChange,
   coins,
   playerLevel,
+  dominantHand,
+  onDominantHandChange,
 }: {
   username: string;
   onUsernameChange: (username: string) => void;
@@ -1372,9 +1377,12 @@ function ProfileView({
   onProfileImageChange: (file: File) => void;
   coins: number;
   playerLevel: PlayerLevel;
+  dominantHand: DominantHand;
+  onDominantHandChange: (hand: DominantHand) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draftUsername, setDraftUsername] = useState(username);
+  const [draftDominantHand, setDraftDominantHand] = useState(dominantHand);
   const [profileImageError, setProfileImageError] = useState("");
   const profileImageInput = useRef<HTMLInputElement>(null);
 
@@ -1383,8 +1391,10 @@ function ProfileView({
       const nextUsername = draftUsername.trim();
       if (!nextUsername) return;
       onUsernameChange(nextUsername);
+      onDominantHandChange(draftDominantHand);
     } else {
       setDraftUsername(username);
+      setDraftDominantHand(dominantHand);
     }
     setEditing((value) => !value);
   }
@@ -1565,6 +1575,30 @@ function ProfileView({
                 <strong>{playerLevel} player</strong>
               </span>
             </div>
+            <div>
+              <span className="account-row-icon">
+                <Icon name="profile" />
+              </span>
+              <span>
+                <small id="dominant-hand-label">Dominant hand</small>
+                {editing ? (
+                  <select
+                    className="profile-hand-select"
+                    aria-labelledby="dominant-hand-label"
+                    value={draftDominantHand}
+                    onChange={(event) => setDraftDominantHand(event.target.value as DominantHand)}
+                  >
+                    <option value="right">Right-handed</option>
+                    <option value="left">Left-handed</option>
+                  </select>
+                ) : (
+                  <strong>{dominantHand === "right" ? "Right-handed" : "Left-handed"}</strong>
+                )}
+                <small>
+                  Drill target: {(editing ? draftDominantHand : dominantHand) === "right" ? "left" : "right"} side of the screen
+                </small>
+              </span>
+            </div>
           </div>
         </section>
 
@@ -1610,6 +1644,14 @@ function ProfileView({
 
 const assessmentQuestions = [
   {
+    question: "Which hand is your dominant hand?",
+    helper: "We will position the drill target to match your dominant hand.",
+    options: [
+      { label: "Right-handed", detail: "The target will be on the left of the screen.", score: 0 },
+      { label: "Left-handed", detail: "The target will be on the right of the screen.", score: 1 },
+    ],
+  },
+  {
     question: "How much organized basketball have you played?",
     helper: "Choose the answer that best matches your experience.",
     options: [
@@ -1654,7 +1696,7 @@ function OnboardingAssessment({
   onBack,
 }: {
   username: string;
-  onComplete: (level: PlayerLevel) => void;
+  onComplete: (level: PlayerLevel, hand: DominantHand) => void;
   onBack: () => void;
 }) {
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -1677,7 +1719,7 @@ function OnboardingAssessment({
       setQuestionIndex((current) => current + 1);
       return;
     }
-    const total = answers.reduce((sum, score) => sum + (score ?? 0), 0);
+    const total = answers.slice(1).reduce((sum, score) => sum + (score ?? 0), 0);
     setResult(getPlacementLevel(total));
   }
 
@@ -1704,7 +1746,7 @@ function OnboardingAssessment({
               <strong>{result} Dribbling</strong>
             </div>
           </div>
-          <button type="button" onClick={() => onComplete(result)}>
+          <button type="button" onClick={() => onComplete(result, answers[0] === 1 ? "left" : "right")}>
             Start my training
             <Icon name="arrow" />
           </button>
@@ -1795,10 +1837,14 @@ function HomeScreen({
   username,
   onUsernameChange,
   playerLevel,
+  dominantHand,
+  onDominantHandChange,
 }: {
   username: string;
   onUsernameChange: (username: string) => void;
   playerLevel: PlayerLevel;
+  dominantHand: DominantHand;
+  onDominantHandChange: (hand: DominantHand) => void;
 }) {
   const [activeTab, setActiveTab] = useState<Tab>("lessons");
   const [profileImage, setProfileImage] = useState<string | null>(null);
@@ -1927,6 +1973,7 @@ function HomeScreen({
   if (drillOpen && activeLesson) {
     return (
       <DrillScreen
+        dominantHand={dominantHand}
         lesson={activeLesson}
         stream={cameraStream}
         cameraState={cameraState}
@@ -2057,6 +2104,8 @@ function HomeScreen({
           <StreakView onTrain={() => setActiveTab("lessons")} />
         ) : activeTab === "profile" ? (
           <ProfileView
+            dominantHand={dominantHand}
+            onDominantHandChange={onDominantHandChange}
             username={username}
             onUsernameChange={onUsernameChange}
             profileImage={profileImage}
@@ -2123,6 +2172,7 @@ export default function App() {
   const [isCreatingAccount, setIsCreatingAccount] = useState(false);
   const [showAssessment, setShowAssessment] = useState(false);
   const [playerLevel, setPlayerLevel] = useState<PlayerLevel>("Beginner");
+  const [dominantHand, setDominantHand] = useState<DominantHand>("right");
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2138,8 +2188,9 @@ export default function App() {
       <OnboardingAssessment
         username={username}
         onBack={() => setShowAssessment(false)}
-        onComplete={(level) => {
+        onComplete={(level, hand) => {
           setPlayerLevel(level);
+          setDominantHand(hand);
           setShowAssessment(false);
           setSignedIn(true);
         }}
@@ -2150,6 +2201,8 @@ export default function App() {
   if (signedIn) {
     return (
       <HomeScreen
+        onDominantHandChange={setDominantHand}
+        dominantHand={dominantHand}
         username={username}
         onUsernameChange={setUsername}
         playerLevel={playerLevel}

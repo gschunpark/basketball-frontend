@@ -2332,6 +2332,28 @@ form {
   text-transform: uppercase;
 }
 
+.profile-hand-select {
+  width: 100%;
+  max-width: 220px;
+  padding: 8px 10px;
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  background: white;
+  color: #17243b;
+  font: inherit;
+}
+
+.profile-hand-select {
+  width: 100%;
+  max-width: 220px;
+  padding: 8px 10px;
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  background: white;
+  color: #17243b;
+  font: inherit;
+}
+
 .account-rows {
   display: grid;
 }
