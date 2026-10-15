@@ -1,4 +1,8 @@
+import BallPhotoSetup from "./BallPhotoSetup";
 import { FormEvent, useEffect, useRef, useState } from "react";
+
+import { advanceScore, isBallMoving, isInTarget, type BallSample } from "./ballTracking";
+import { brightenBallPicture, CameraBudget } from "./cameraQuality";
 
 type Tab = "lessons" | "goals" | "streak" | "profile";
 type PlayerLevel = "Beginner" | "Intermediate" | "Advanced" | "NBA";
@@ -539,7 +543,7 @@ function LessonComplete({ lesson, result, onContinue }: {
           </div>)}
         </div>
         <p className="completion-note">{lesson.cameraDrill
-          ? "Good reps were inside the green box. Bad reps were outside the box."
+          ? "Each rep is one second of detected ball movement inside the green box."
           : "Rep tracking is available in the first dribbling drill."}</p>
       </section>
       <footer className="completion-footer"><button type="button" onClick={onContinue} autoFocus>Continue<Icon name="arrow" /></button></footer>
@@ -590,9 +594,22 @@ function DrillScreen({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animationRef = useRef<number | null>(null);
+  const [detectorState, setDetectorState] = useState<"loading" | "ready" | "error">("loading");
+  const [detectorAttempt, setDetectorAttempt] = useState(0);
+  const [phase, setPhase] = useState<"intro" | "calibrate" | "countdown" | "active">("intro");
+  const phaseRef = useRef(phase);
+  const [calibrationPending, setCalibrationPending] = useState(false);
+  const ballWorkerRef = useRef<Worker | null>(null);
+  const [countdown, setCountdown] = useState(3);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [torchPending, setTorchPending] = useState(false);
+  const [lightError, setLightError] = useState("");
+  const [screenLight, setScreenLight] = useState(false);
   const [count, setCount] = useState(0);
   const repsRef = useRef({ goodReps: 0, badReps: 0 });
+  const scoringResetRef = useRef(0);
+  const [ballMoving, setBallMoving] = useState(false);
   const startedAtRef = useRef<number | null>(null);
   const finishedRef = useRef(false);
   const [zoneState, setZoneState] = useState<ZoneState>("searching");
@@ -601,16 +618,74 @@ function DrillScreen({
     y: number;
   } | null>(null);
 
+  function changePhase(next: typeof phase) {
+    phaseRef.current = next;
+    setPhase(next);
+  }
+
+  useEffect(() => {
+    const track = stream?.getVideoTracks()[0];
+    const capabilities = track?.getCapabilities?.() as (MediaTrackCapabilities & { torch?: boolean }) | undefined;
+    setTorchSupported(capabilities?.torch === true);
+    setTorchOn(Boolean((track?.getSettings?.() as (MediaTrackSettings & { torch?: boolean }) | undefined)?.torch));
+    setLightError("");
+  }, [stream]);
+
+  async function toggleFlashlight() {
+    const track = stream?.getVideoTracks()[0];
+    if (!track || !torchSupported || torchPending) return;
+    const enabled = !torchOn;
+    setTorchPending(true);
+    setLightError("");
+    try {
+      const constraints: MediaTrackConstraints & { advanced: (MediaTrackConstraintSet & { torch: boolean })[] } = {
+        ...track.getConstraints(), advanced: [{ torch: enabled }],
+      };
+      await track.applyConstraints(constraints);
+      setTorchOn(Boolean((track.getSettings() as MediaTrackSettings & { torch?: boolean }).torch));
+    } catch {
+      setLightError("The camera flashlight could not be changed. Try screen light instead.");
+    } finally { setTorchPending(false); }
+  }
+
+  useEffect(() => {
+    if (phase === "calibrate") return;
+    setScreenLight(false);
+    const track = stream?.getVideoTracks()[0];
+    if (track?.readyState === "live" && (track.getSettings() as MediaTrackSettings & { torch?: boolean }).torch) {
+      const constraints: MediaTrackConstraints & { advanced: (MediaTrackConstraintSet & { torch: boolean })[] } = {
+        ...track.getConstraints(), advanced: [{ torch: false }],
+      };
+      void track.applyConstraints(constraints).then(() => setTorchOn(false)).catch(() => setLightError("Turn off the flashlight using the camera controls."));
+    }
+  }, [phase, stream]);
+
+  useEffect(() => {
+    if (phase !== "countdown") return;
+    setCountdown(3);
+    let remaining = 3;
+    const interval = window.setInterval(() => {
+      if (document.hidden) return;
+      remaining -= 1;
+      if (remaining === 0) {
+        window.clearInterval(interval);
+        startedAtRef.current = performance.now();
+        scoringResetRef.current += 1;
+        changePhase("active");
+      } else setCountdown(remaining);
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [phase]);
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !stream) return;
     video.srcObject = stream;
     video.play().catch(() => undefined);
-    if (startedAtRef.current === null) startedAtRef.current = performance.now();
   }, [stream]);
 
   function finishDrill() {
-    if (finishedRef.current || (lesson.cameraDrill && count < 30)) return;
+    if (finishedRef.current || phaseRef.current !== "active" || (lesson.cameraDrill && count < 15)) return;
     finishedRef.current = true;
     onComplete({
       ...repsRef.current,
@@ -619,7 +694,7 @@ function DrillScreen({
   }
 
   useEffect(() => {
-    if (lesson.cameraDrill && count >= 30) finishDrill();
+    if (lesson.cameraDrill && count >= 15) finishDrill();
   }, [count, lesson.cameraDrill]);
 
   useEffect(() => {
@@ -627,104 +702,189 @@ function DrillScreen({
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d", { willReadFrequently: true });
+    const context = canvas?.getContext("2d");
     if (!video || !canvas || !context) return;
 
-    canvas.width = 160;
-    canvas.height = 120;
-    let frame = 0;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let freshnessTimer: ReturnType<typeof setTimeout> | undefined;
+    const worker = new Worker(new URL("./ballDetector.worker.ts", import.meta.url), { type: "module" });
+    ballWorkerRef.current = worker;
+    type BallDetection = { bbox: [number, number, number, number]; score: number; id: number };
+    let resolveFrame: ((balls: BallDetection[]) => void) | undefined;
+    let rejectFrame: ((reason: Error) => void) | undefined;
+    let lastVideoTime = -1;
+    let analysisEdge = 400;
+    const cameraBudget = new CameraBudget();
+    let qualityChanging = false;
+    let trackId: number | null = null;
     let previousY: number | null = null;
-    let direction = 0;
-    let lastCountAt = 0;
+    let previousX: number | null = null;
+    let samples: BallSample[] = [];
+    let activeMilliseconds = 0;
+    let wasActive = false;
+    let scoringReset = scoringResetRef.current;
+    let lastSeenAt = 0;
+    setDetectorState("loading");
+    setBallPosition(null);
+    setZoneState("searching");
 
-    const detectBall = () => {
-      if (finishedRef.current) return;
-      animationRef.current = requestAnimationFrame(detectBall);
-      frame += 1;
-      if (frame % 3 !== 0 || video.readyState < 2) return;
-
-      // Match the centered object-fit: cover crop shown in the camera preview.
+    const detectBall = async () => {
+      if (cancelled || finishedRef.current) return;
+      if (video.readyState < 2 || !video.clientWidth || !video.clientHeight) {
+        timer = setTimeout(() => void runDetection(), 100);
+        return;
+      }
+      if ((phaseRef.current === "intro" || phaseRef.current === "calibrate") || video.currentTime === lastVideoTime || document.hidden) {
+        timer = setTimeout(() => void runDetection(), 16);
+        return;
+      }
+      lastVideoTime = video.currentTime;
+      const processingStarted = performance.now();
+      // Detect the exact crop displayed by object-fit: cover, then mirror its coordinates.
       const previewRatio = video.clientWidth / video.clientHeight;
       const sourceRatio = video.videoWidth / video.videoHeight;
       const sourceWidth = sourceRatio > previewRatio
         ? video.videoHeight * previewRatio : video.videoWidth;
       const sourceHeight = sourceRatio > previewRatio
         ? video.videoHeight : video.videoWidth / previewRatio;
+      canvas.width = Math.round(Math.min(sourceWidth, analysisEdge * Math.min(1, previewRatio)));
+      canvas.height = Math.round(canvas.width / previewRatio);
       context.drawImage(video,
         (video.videoWidth - sourceWidth) / 2,
         (video.videoHeight - sourceHeight) / 2,
         sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
-      const image = context.getImageData(0, 0, canvas.width, canvas.height);
-      let matchingPixels = 0;
-      let totalX = 0;
-      let totalY = 0;
-
-      for (let y = 0; y < canvas.height; y += 2) {
-        for (let x = 0; x < canvas.width; x += 2) {
-          const index = (y * canvas.width + x) * 4;
-          const red = image.data[index];
-          const green = image.data[index + 1];
-          const blue = image.data[index + 2];
-          const looksLikeBasketball =
-            red > 115 &&
-            red > green * 1.2 &&
-            green > blue * 1.08 &&
-            red - blue > 55;
-
-          if (looksLikeBasketball) {
-            matchingPixels += 1;
-            totalX += x;
-            totalY += y;
-          }
-        }
+      const frame = await createImageBitmap(canvas);
+      if (cancelled || finishedRef.current) { frame.close(); return; }
+      const balls = await new Promise<BallDetection[]>((resolve, reject) => {
+        resolveFrame = resolve;
+        rejectFrame = reject;
+        worker.postMessage({ type: "frame", frame, timestamp: processingStarted }, [frame]);
+      });
+      if (cancelled || finishedRef.current) return;
+      const preferredWidth = cameraBudget.observe(performance.now() - processingStarted, performance.now());
+      const track = stream.getVideoTracks()[0];
+      if (preferredWidth && track && !qualityChanging) {
+        const capabilities = track.getCapabilities?.();
+        const width = Math.min(preferredWidth, capabilities?.width?.max ?? preferredWidth);
+        qualityChanging = true;
+        void track.applyConstraints({ ...track.getConstraints(), width: { ideal: width }, height: { ideal: Math.round(width * 9 / 16) }, frameRate: { ideal: 60, max: 60 } })
+          .catch(() => undefined).finally(() => { qualityChanging = false; });
       }
-
-      if (matchingPixels < 22) {
+      // The worker follows one ball across frames and returns its stable track ID.
+      clearTimeout(freshnessTimer);
+      const ball = performance.now() - processingStarted <= 200 ? balls[0] : undefined;
+      if (!ball) {
         setBallPosition(null);
         setZoneState("searching");
         previousY = null;
-        direction = 0;
+        previousX = null;
+        trackId = null;
+        samples = [];
+        wasActive = false;
+        setBallMoving(false);
+        timer = setTimeout(() => void runDetection(), 0);
         return;
       }
-
-      const cameraX = totalX / matchingPixels / canvas.width;
-      const normalizedX = 1 - cameraX;
-      const normalizedY = totalY / matchingPixels / canvas.height;
-      const inside =
-        (dominantHand === "right"
-          ? normalizedX >= 0.08 && normalizedX <= 0.28
-          : normalizedX >= 0.72 && normalizedX <= 0.92) &&
-        normalizedY >= 0.14 &&
-        normalizedY <= 0.86;
+      const normalizedX = 1 - (ball.bbox[0] + ball.bbox[2] / 2) / canvas.width;
+      const normalizedY = (ball.bbox[1] + ball.bbox[3] / 2) / canvas.height;
+      const now = performance.now();
+      if (ball.id !== trackId || now - lastSeenAt > 500 || (previousX !== null && previousY !== null &&
+        Math.hypot(normalizedX - previousX, normalizedY - previousY) > 0.35)) {
+        previousY = null;
+        samples = [];
+        wasActive = false;
+        setBallMoving(false);
+      }
+      const elapsed = now - lastSeenAt;
+      trackId = ball.id;
+      lastSeenAt = now;
+      if (scoringReset !== scoringResetRef.current) {
+        scoringReset = scoringResetRef.current;
+        samples = [];
+        activeMilliseconds = 0;
+        wasActive = false;
+      }
+      samples = samples.filter((sample) => now - sample.at <= 350);
+      samples.push({ x: normalizedX, y: normalizedY, at: now });
+      const moving = isBallMoving(samples);
+      const inside = isInTarget(normalizedX, normalizedY, dominantHand);
+      setBallMoving(moving);
 
       setBallPosition({ x: normalizedX * 100, y: normalizedY * 100 });
+      freshnessTimer = setTimeout(() => {
+        setBallPosition(null); setBallMoving(false); setZoneState("searching");
+        previousX = null; previousY = null; samples = []; wasActive = false;
+      }, Math.max(0, 200 - (performance.now() - processingStarted)));
       setZoneState(inside ? "inside" : "outside");
 
-      if (previousY !== null) {
-        const movement = normalizedY - previousY;
-        if (movement > 0.012) direction = 1;
-        if (
-          movement < -0.01 &&
-          direction === 1 &&
-          performance.now() - lastCountAt > 420
-        ) {
-          if (inside) repsRef.current.goodReps += 1;
-          else repsRef.current.badReps += 1;
-          setCount((value) => value + (inside ? 1 : -1));
-          lastCountAt = performance.now();
-          direction = -1;
-        }
+      const active = phaseRef.current === "active" && inside && moving && !document.hidden;
+      const score = advanceScore(activeMilliseconds, elapsed, active && wasActive);
+      activeMilliseconds = score.milliseconds;
+      wasActive = active;
+      if (score.points > 0) {
+        const awarded = Math.min(score.points, 15 - repsRef.current.goodReps);
+        repsRef.current.goodReps += awarded;
+        setCount(repsRef.current.goodReps);
       }
       previousY = normalizedY;
+      previousX = normalizedX;
+      timer = setTimeout(() => void runDetection(), 0);
     };
 
-    animationRef.current = requestAnimationFrame(detectBall);
-    return () => {
-      if (animationRef.current !== null) {
-        cancelAnimationFrame(animationRef.current);
+    const runDetection = async () => {
+      try {
+        await detectBall();
+      } catch {
+        if (!cancelled) {
+          setDetectorState("error");
+          setBallPosition(null);
+          setZoneState("searching");
+        }
       }
     };
-  }, [stream, lesson.cameraDrill, dominantHand]);
+
+    const failDetection = () => {
+      if (cancelled) return;
+      setDetectorState("error");
+      setBallPosition(null);
+      setZoneState("searching");
+      setBallMoving(false);
+      setCalibrationPending(false);
+      rejectFrame?.(new Error("Ball detection failed"));
+      resolveFrame = undefined;
+      rejectFrame = undefined;
+    };
+    worker.onmessage = (event) => {
+      if (cancelled) return;
+      if (event.data.type === "ready") {
+        setDetectorState("ready");
+        void runDetection();
+
+      } else if (event.data.type === "result") {
+        if (Number.isFinite(event.data.analysisEdge)) analysisEdge = Math.max(320, Math.min(960, event.data.analysisEdge));
+        resolveFrame?.(event.data.balls);
+        resolveFrame = undefined;
+        rejectFrame = undefined;
+      } else if (event.data.type === "error") {
+        failDetection();
+      }
+    };
+    worker.onerror = failDetection;
+    const base = new URL(import.meta.env.BASE_URL, window.location.href);
+    worker.postMessage({
+      type: "initialize",
+      modelUrl: new URL("tensorflow/ball/model.json", base).href,
+    });
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      clearTimeout(freshnessTimer);
+      resolveFrame?.([]);
+      worker.terminate();
+      if (ballWorkerRef.current === worker) ballWorkerRef.current = null;
+    };
+  }, [stream, lesson.cameraDrill, dominantHand, detectorAttempt]);
 
   return (
     <main className="drill-page">
@@ -737,17 +897,17 @@ function DrillScreen({
           <p>{lesson.difficulty} training</p>
           <h1>{lesson.title}</h1>
         </div>
-        <span className="drill-step">Live practice</span>
+        <span className="drill-step">{phase === "active" ? "Live practice" : "Getting ready"}</span>
       </header>
 
       {cameraState === "ready" && stream ? (
         <div className="drill-layout">
-          <section className="camera-card">
+          <section className={`camera-card ${screenLight ? "screen-light" : ""}`}>
             <div className="camera-stage">
               <video ref={videoRef} muted playsInline />
               <canvas ref={canvasRef} aria-hidden="true" />
-              {lesson.cameraDrill && <>
-                <div className={`target-zone target-zone-${dominantHand === "right" ? "left" : "right"}`}><span>+1</span></div>
+              {lesson.cameraDrill && (phase === "active" || phase === "countdown") && <>
+                <div className={`target-zone target-zone-${dominantHand}`}><span>+1</span></div>
               </>}
               {ballPosition && (
                 <span
@@ -759,18 +919,67 @@ function DrillScreen({
                   aria-hidden="true"
                 />
               )}
-              {lesson.cameraDrill && <div className={`detection-status ${zoneState}`}>
+              {lesson.cameraDrill && phase === "active" && <div className={`detection-status ${zoneState}`}>
                 <span />
-                {zoneState === "inside"
-                  ? "Ball in target"
+                {detectorState === "loading" ? "Loading ball detection..."
+                  : detectorState === "error" ? "Ball detection unavailable"
+                  : zoneState === "inside"
+                  ? ballMoving ? "Moving in target - scoring" : "Move the ball to score"
                   : zoneState === "outside"
                     ? "Ball outside target"
-                    : "Looking for orange ball"}
+                    : "Looking for basketball"}
               </div>}
+              {phase === "intro" && (
+                <div className="drill-setup-overlay">
+                  <div className="drill-setup-card">
+                    <p>Before you begin</p>
+                    <h2>{lesson.title}</h2>
+                    <span>{lesson.cameraDrill
+                      ? `Keep dribbling in the green area on the ${dominantHand} side of the screen. Each second of ball movement earns one rep. Your goal is 15 reps.`
+                      : lesson.description}</span>
+                    <button type="button" className="complete-drill" onClick={() => changePhase(lesson.cameraDrill ? "calibrate" : "countdown")}>
+                      {lesson.cameraDrill ? "Set up my ball" : "Start countdown"}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {phase === "countdown" && (
+                <div className="drill-setup-overlay countdown-overlay" role="status" aria-live="assertive">
+                  <p>Step back and get ready</p>
+                  <strong>{countdown}</strong>
+                  <span>{lesson.cameraDrill ? `Move your ball into the green area on the ${dominantHand}.` : "Your practice is about to start."}</span>
+                </div>
+              )}
             </div>
+            {phase === "calibrate" && (
+              <section className="ball-calibration-controls">
+                <div className="calibration-light-controls" role="group" aria-label="Picture lighting">
+                  <button type="button" aria-pressed={torchOn} disabled={!torchSupported || torchPending || calibrationPending} onClick={() => void toggleFlashlight()}>
+                    <Icon name="bolt" /> {torchPending ? "Changing light..." : torchOn ? "Flashlight on" : "Flashlight"}
+                  </button>
+                  <button type="button" aria-pressed={screenLight} disabled={calibrationPending} onClick={() => setScreenLight((value) => !value)}>
+                    <Icon name="bolt" /> {screenLight ? "Screen light on" : "Screen light"}
+                  </button>
+                </div>
+                {!torchSupported && <p className="lighting-hint">This camera has no flashlight control. Screen light adds a bright border to help light your ball.</p>}
+                {lightError && <p role="status" className="lighting-hint">{lightError}</p>}
+                <BallPhotoSetup video={videoRef.current} worker={ballWorkerRef.current} ready={detectorState === "ready" && !torchPending} onBusyChanged={setCalibrationPending} onConfirmed={() => changePhase("countdown")} />
+              </section>
+            )}
+            {lesson.cameraDrill && detectorState === "error" && (
+              <div className="camera-privacy" role="alert">
+                Ball detection could not start. Check your connection and try again.
+                <button type="button" className="secondary-button" onClick={() => {
+                  setCalibrationPending(false);
+                  changePhase("calibrate");
+                  setDetectorAttempt((value) => value + 1);
+                }}>Retry ball detection</button>
+              </div>
+            )}
             <p className="camera-privacy">
               Camera processing stays on this device and is not recorded.
             </p>
+            <p className="ball-visibility-warning"><Icon name="camera" /><span><strong>Keep the ball on screen the entire time.</strong> Keep it fully inside the camera view while setting up and dribbling.</span></p>
           </section>
 
           <aside className="drill-sidebar">
@@ -778,9 +987,9 @@ function DrillScreen({
             <section className={`dribble-counter ${zoneState}`}>
               <p>Dribble score</p>
               <strong>{count}</strong>
-              <span>Goal: 30 points</span>
+              <span>Goal: 15 reps</span>
               <div>
-                <span style={{ width: `${Math.max(0, Math.min((count / 30) * 100, 100))}%` }} />
+                <span style={{ width: `${Math.max(0, Math.min((count / 15) * 100, 100))}%` }} />
               </div>
             </section>
 
@@ -793,11 +1002,11 @@ function DrillScreen({
                 </li>
                 <li>
                   <span>2</span>
-                  Keep the orange ball in either green side rectangle.
+                  Keep the basketball in the green rectangle.
                 </li>
                 <li>
                   <span>3</span>
-                  Each detected dribble scores +1 inside the green box or -1 outside. Your score can go below zero.
+                  Every second the detected ball is moving inside the green box earns 1 rep. Reach 15 reps to finish.
                 </li>
               </ol>
             </section>
@@ -805,19 +1014,21 @@ function DrillScreen({
             <button
               type="button"
               className="complete-drill"
-              disabled={count < 30}
+              disabled={phase !== "active" || count < 15}
               onClick={finishDrill}
             >
-              <Icon name={count >= 30 ? "coin" : "lock"} />
-              {count >= 30
+              <Icon name={count >= 15 ? "coin" : "lock"} />
+              {count >= 15
                 ? `Complete lesson · +${reward} coins`
-                : `${30 - count} points until reward`}
+                : `${15 - count} points until reward`}
             </button>
 
             <button
               type="button"
               className="reset-counter"
+              disabled={phase !== "active"}
               onClick={() => {
+                scoringResetRef.current += 1;
                 setCount(0);
                 repsRef.current = { goodReps: 0, badReps: 0 };
                 startedAtRef.current = performance.now();
@@ -826,6 +1037,10 @@ function DrillScreen({
               <Icon name="reset" />
               Reset counter
             </button>
+            {phase === "active" && <button type="button" className="reset-counter" onClick={() => {
+              scoringResetRef.current += 1;
+              changePhase("calibrate");
+            }}>Recalibrate ball</button>}
             </> : <>
               <section className="drill-instructions">
                 <p>Your practice</p>
@@ -833,7 +1048,7 @@ function DrillScreen({
                 <p>{lesson.description}</p>
                 <p>Keep yourself in view and use the live preview to check your technique.</p>
               </section>
-              <button type="button" className="complete-drill" onClick={finishDrill}>Finish practice · +{reward} coins</button>
+              <button type="button" className="complete-drill" disabled={phase !== "active"} onClick={finishDrill}>Finish practice · +{reward} coins</button>
             </>}
           </aside>
         </div>
@@ -1595,7 +1810,7 @@ function ProfileView({
                   <strong>{dominantHand === "right" ? "Right-handed" : "Left-handed"}</strong>
                 )}
                 <small>
-                  Drill target: {(editing ? draftDominantHand : dominantHand) === "right" ? "left" : "right"} side of the screen
+                  Drill target: {(editing ? draftDominantHand : dominantHand) === "right" ? "right" : "left"} side of the screen
                 </small>
               </span>
             </div>
@@ -1647,8 +1862,8 @@ const assessmentQuestions = [
     question: "Which hand is your dominant hand?",
     helper: "We will position the drill target to match your dominant hand.",
     options: [
-      { label: "Right-handed", detail: "The target will be on the left of the screen.", score: 0 },
-      { label: "Left-handed", detail: "The target will be on the right of the screen.", score: 1 },
+      { label: "Right-handed", detail: "The target will be on the right of the screen.", score: 0 },
+      { label: "Left-handed", detail: "The target will be on the left of the screen.", score: 1 },
     ],
   },
   {
@@ -1908,8 +2123,9 @@ function HomeScreen({
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: "user" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 3840 },
+          height: { ideal: 2160 },
+          frameRate: { ideal: 60, max: 60 },
         },
         audio: false,
       });
